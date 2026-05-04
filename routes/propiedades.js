@@ -2,52 +2,42 @@ const express = require('express');
 const router = express.Router();
 const axios = require('axios');
 
-// Configuración de Axios para Alaluf
+// Configuración de Axios: validateStatus permite que el código siga ejecutándose en 404
 const alalufAxios = axios.create({
     headers: {
         'X-API-KEY': process.env.ALALUF_API_KEY,
         'User-Agent': 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'application/json'
     },
-    timeout: 30000 
+    timeout: 30000,
+    validateStatus: (status) => status < 500 
 });
 
 const BASE_URL_ALALUF = "https://alaluf.cl";
 const SISTEMA_URL_ALALUF = "https://sistema.alaluf.com"; 
 
-/**
- * MEJORA: Función de Geocodificación con Reintentos y Fallback
- */
 const obtenerCoordenadas = async (direccion) => {
     const token = process.env.MAPBOX_TOKEN || process.env.VITE_MAPBOX_TOKEN;
-    
-    if (!token) {
-        console.error("❌ [ERROR] MAPBOX_TOKEN no detectado. Revisa tu archivo .env");
-        return null;
-    }
+    if (!token) return null;
 
     try {
         const query = encodeURIComponent(direccion);
         const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${query}.json?access_token=${token}&limit=1&country=cl`;
-        
-        const resp = await axios.get(url, { timeout: 5000 }); // Timeout corto para no bloquear
+        const resp = await axios.get(url, { timeout: 5000 });
 
         if (resp.data.features && resp.data.features.length > 0) {
             const [lng, lat] = resp.data.features[0].center;
             return { lat, lng };
         }
     } catch (error) {
-        console.error(`❌ [ERROR GEOCODE]: ${direccion} - ${error.message}`);
+        console.error(`❌ [GEOCODE ERROR]: ${direccion} - ${error.message}`);
     }
     return null;
 };
 
 const mapearPropiedad = (prop) => {
     let fotosRaw = prop.fotos || prop.foto || prop.foto_portada || prop.imagen || [];
-    
-    if (typeof fotosRaw === 'string' && fotosRaw.length > 0) {
-        fotosRaw = [fotosRaw];
-    }
+    if (typeof fotosRaw === 'string' && fotosRaw.length > 0) fotosRaw = [fotosRaw];
 
     const imagenesProcesadas = Array.isArray(fotosRaw) 
         ? fotosRaw.map(f => {
@@ -59,7 +49,6 @@ const mapearPropiedad = (prop) => {
         }).filter(f => f !== null)
         : [];
 
-    // Validamos: si la API manda 0 o null, lo marcamos como null para el proceso de mejora
     const lat = parseFloat(prop.latitud);
     const lng = parseFloat(prop.longitud);
 
@@ -101,71 +90,80 @@ router.get('/buscar', async (req, res) => {
         const response = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, { params: req.query });
         const rawDataArray = response.data?.data || [];
 
-        // MEJORA: Procesamiento inteligente de coordenadas
         const propiedadesProcesadas = await Promise.all(rawDataArray.map(async (prop) => {
             let mapeada = mapearPropiedad(prop);
-
-            // Si no hay coordenadas, entramos al flujo de recuperación
             if (!mapeada.coords.lat || !mapeada.coords.lng) {
                 const calle = (prop.direccion || "").trim();
                 const comuna = (prop.com_nombre || "").trim();
-
-                // Intento 1: Dirección completa
                 if (calle.length > 3) {
-                    const busquedaFull = `${calle}, ${comuna}, Chile`;
-                    const coords = await obtenerCoordenadas(busquedaFull);
-                    if (coords) {
-                        mapeada.coords = coords;
-                        console.log(`✅ [OK] Geolocalizado: ${busquedaFull}`);
-                    }
-                }
-
-                // Intento 2: Solo Comuna (Fallback para que el mapa no quede vacío)
-                if (!mapeada.coords.lat && comuna.length > 2) {
-                    const busquedaComuna = `${comuna}, Chile`;
-                    const coordsComuna = await obtenerCoordenadas(busquedaComuna);
-                    if (coordsComuna) {
-                        mapeada.coords = coordsComuna;
-                        console.log(`⚠️ [FALLBACK] Geolocalizado por Comuna: ${busquedaComuna}`);
-                    }
+                    const coords = await obtenerCoordenadas(`${calle}, ${comuna}, Chile`);
+                    if (coords) mapeada.coords = coords;
                 }
             }
             return mapeada;
         }));
-
         res.json(propiedadesProcesadas);
     } catch (error) {
-        console.error(`[ALALUF ERROR] ${error.message}`);
         res.status(500).json({ error: "Error en el servidor de búsqueda" });
     }
 });
 
+/**
+ * RUTA MEJORADA: Soporta ID (447) y Código (18870)
+ */
 router.get('/:id', async (req, res) => {
+    const term = req.params.id;
+    let rawData = null;
+
     try {
-        const response = await alalufAxios.get(`${BASE_URL_ALALUF}/api/propiedad.php`, {
-            params: { id_propiedad: req.params.id }
+        // Intento 1: Ficha directa
+        const responseDirecta = await alalufAxios.get(`${BASE_URL_ALALUF}/api/propiedad.php`, {
+            params: { id_propiedad: term }
         });
-        const rawData = response.data?.data;
+        
+        if (responseDirecta.status === 200 && responseDirecta.data?.data) {
+            rawData = responseDirecta.data.data;
+        }
+
+        // Intento 2: Rescate si la directa falló (404 o sin data)
+        if (!rawData) {
+            const responseBusqueda = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, {
+                params: { q: term }
+            });
+
+            const resultados = responseBusqueda.data?.data || [];
+            
+            // Buscamos coincidencia exacta por ID o por Código Interno
+            const match = resultados.find(p => 
+                p.id_propiedad == term || 
+                p.codigo_interno == term
+            );
+
+            if (match) {
+                // Re-intentamos la ficha usando el ID que la API reconoció en la búsqueda
+                const retryResponse = await alalufAxios.get(`${BASE_URL_ALALUF}/api/propiedad.php`, {
+                    params: { id_propiedad: match.id_propiedad }
+                });
+                rawData = retryResponse.data?.data;
+            }
+        }
+
         if (!rawData) return res.status(404).json({ error: "Propiedad no encontrada" });
 
         let mapeada = mapearPropiedad(rawData);
 
-        // Lógica de recuperación para ficha individual
+        // Geocodificación fallback
         if (!mapeada.coords.lat || !mapeada.coords.lng) {
             const direccion = `${rawData.direccion || ''}, ${rawData.com_nombre || ''}, Chile`;
             const coords = await obtenerCoordenadas(direccion);
-            if (coords) {
-                mapeada.coords = coords;
-            } else {
-                // Fallback a comuna si falla la dirección
-                const coordsComuna = await obtenerCoordenadas(`${rawData.com_nombre}, Chile`);
-                if (coordsComuna) mapeada.coords = coordsComuna;
-            }
+            if (coords) mapeada.coords = coords;
         }
 
         res.json(mapeada);
+
     } catch (error) {
-        res.status(500).json({ error: "Error al cargar la propiedad" });
+        console.error(`💥 [ERROR]: ${error.message}`);
+        res.status(500).json({ error: "Error interno del servidor" });
     }
 });
 
