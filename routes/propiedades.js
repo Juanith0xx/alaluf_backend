@@ -36,16 +36,32 @@ const obtenerCoordenadas = async (direccion) => {
 };
 
 const mapearPropiedad = (prop) => {
-    let fotosRaw = prop.fotos || prop.foto || prop.foto_portada || prop.imagen || [];
-    if (typeof fotosRaw === 'string' && fotosRaw.length > 0) fotosRaw = [fotosRaw];
+    // 1. MEJORA EN IMÁGENES: Cubrimos más nombres de campos que res.php podría usar
+    let fotosRaw = prop.fotos || prop.foto || prop.foto_portada || prop.imagen || prop.path_foto || prop.img_1 || [];
+    
+    // Si viene como string (a veces separado por comas), lo convertimos a array
+    if (typeof fotosRaw === 'string' && fotosRaw.length > 0) {
+        fotosRaw = fotosRaw.includes(',') ? fotosRaw.split(',') : [fotosRaw];
+    }
 
     const imagenesProcesadas = Array.isArray(fotosRaw) 
         ? fotosRaw.map(f => {
             if (!f || typeof f !== 'string') return null;
-            const link = f.trim();
+            let link = f.trim();
+            
             if (link.startsWith('http')) return link;
-            if (link.startsWith('/nuevo')) return `${SISTEMA_URL_ALALUF}${link}`;
-            return `${BASE_URL_ALALUF}${link.startsWith('/') ? link : '/' + link}`;
+            
+            // CORRECCIÓN CLAVE: Asegurar que la ruta siempre empiece con '/'
+            // Esto evita el bug donde res.php manda "nuevo/uploads/..." sin el slash
+            if (!link.startsWith('/')) {
+                link = '/' + link;
+            }
+
+            // Ahora la validación funcionará independientemente del endpoint
+            if (link.startsWith('/nuevo')) {
+                return `${SISTEMA_URL_ALALUF}${link}`;
+            }
+            return `${BASE_URL_ALALUF}${link}`;
         }).filter(f => f !== null)
         : [];
 
@@ -54,11 +70,16 @@ const mapearPropiedad = (prop) => {
 
     return {
         id: prop.id_propiedad,          
-        codigo: prop.codigo_interno,    
-        titulo: prop.desc_tipo || "Propiedad",
+        
+        // 🎯 AQUI ESTÁ LA MEJORA: 'codigo_propiedad' (buscador general) o 'codigo_interno' (ficha individual)
+        codigo: prop.codigo_propiedad || prop.codigo_interno || prop.id_propiedad,    
+        
+        // 🎯 AQUI ESTÁ LA MEJORA: 'desc_tipo_prop' (buscador general) o 'desc_tipo' (ficha individual)
+        titulo: prop.desc_tipo_prop || prop.desc_tipo || "Propiedad",
+        
         operacion: prop.desc_obj || "Venta / Arriendo",
         ubicacion: {
-            comuna: prop.com_nombre || "Sin Comuna",
+            comuna: prop.com_nombre || prop.comuna || "Sin Comuna",
             sector: prop.sector_cercano || "Sin Sector",
             region: prop.region || "Metropolitana",
             direccion: prop.direccion || "" 
@@ -77,7 +98,7 @@ const mapearPropiedad = (prop) => {
             dormitorios: parseInt(prop.dormitorios) || 0,
             privados: parseInt(prop.privados) || 0,
             estacionamientos: parseInt(prop.estacionamientos) || 0,
-            descripcion: prop.caracteristicas_internet || ""
+            descripcion: prop.caracteristicas_internet || prop.observaciones || ""
         },
         imagenes: imagenesProcesadas
     };
@@ -92,6 +113,26 @@ router.get('/buscar', async (req, res) => {
 
         const propiedadesProcesadas = await Promise.all(rawDataArray.map(async (prop) => {
             let mapeada = mapearPropiedad(prop);
+
+            // 🌟 NUEVA MAGIA: Si la propiedad viene sin fotos desde res.php, 
+            // consultamos rápidamente su ficha individual para extraerlas.
+            if (mapeada.imagenes.length === 0) {
+                try {
+                    const fichaResp = await alalufAxios.get(`${BASE_URL_ALALUF}/api/propiedad.php`, {
+                        params: { id_propiedad: prop.id_propiedad } // Usamos el ID para buscarla
+                    });
+                    
+                    if (fichaResp.data && fichaResp.data.data) {
+                        // Reutilizamos tu propia función para mapear las fotos correctamente
+                        const fichaCompleta = mapearPropiedad(fichaResp.data.data);
+                        mapeada.imagenes = fichaCompleta.imagenes; 
+                    }
+                } catch (error) {
+                    console.error(`❌ [FOTO ERROR]: No se pudieron cargar fotos para ID ${prop.id_propiedad}`);
+                }
+            }
+
+            // Geocodificación (tu código original intacto)
             if (!mapeada.coords.lat || !mapeada.coords.lng) {
                 const calle = (prop.direccion || "").trim();
                 const comuna = (prop.com_nombre || "").trim();
@@ -100,10 +141,13 @@ router.get('/buscar', async (req, res) => {
                     if (coords) mapeada.coords = coords;
                 }
             }
+            
             return mapeada;
         }));
+        
         res.json(propiedadesProcesadas);
     } catch (error) {
+        console.error(error);
         res.status(500).json({ error: "Error en el servidor de búsqueda" });
     }
 });
