@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const axios = require('axios');
 
-// Configuración de Axios: validateStatus permite que el código siga ejecutándose en 404
+// Configuración de Axios
 const alalufAxios = axios.create({
     headers: {
         'X-API-KEY': process.env.ALALUF_API_KEY,
@@ -15,6 +15,9 @@ const alalufAxios = axios.create({
 
 const BASE_URL_ALALUF = "https://alaluf.cl";
 const SISTEMA_URL_ALALUF = "https://sistema.alaluf.com"; 
+
+// ⏱️ FUNCION PARA EVITAR BLOQUEOS DEL SERVIDOR
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 const obtenerCoordenadas = async (direccion) => {
     const token = process.env.MAPBOX_TOKEN || process.env.VITE_MAPBOX_TOKEN;
@@ -30,16 +33,14 @@ const obtenerCoordenadas = async (direccion) => {
             return { lat, lng };
         }
     } catch (error) {
-        console.error(`❌ [GEOCODE ERROR]: ${direccion} - ${error.message}`);
+        console.error(`❌ [GEOCODE ERROR]: ${direccion}`);
     }
     return null;
 };
 
 const mapearPropiedad = (prop) => {
-    // 1. MEJORA EN IMÁGENES: Cubrimos más nombres de campos que res.php podría usar
-    let fotosRaw = prop.fotos || prop.foto || prop.foto_portada || prop.imagen || prop.path_foto || prop.img_1 || [];
+    let fotosRaw = prop.foto_principal || prop.fotos || prop.foto || prop.foto_portada || prop.imagen || prop.path_foto || prop.img_1 || [];
     
-    // Si viene como string (a veces separado por comas), lo convertimos a array
     if (typeof fotosRaw === 'string' && fotosRaw.length > 0) {
         fotosRaw = fotosRaw.includes(',') ? fotosRaw.split(',') : [fotosRaw];
     }
@@ -48,18 +49,21 @@ const mapearPropiedad = (prop) => {
         ? fotosRaw.map(f => {
             if (!f || typeof f !== 'string') return null;
             let link = f.trim();
-            
             if (link.startsWith('http')) return link;
             
-            // CORRECCIÓN CLAVE: Asegurar que la ruta siempre empiece con '/'
-            // Esto evita el bug donde res.php manda "nuevo/uploads/..." sin el slash
-            if (!link.startsWith('/')) {
-                link = '/' + link;
+            // 🚨 SOLUCIÓN AL BUG DE LAS FOTOS 🚨
+            // Si el link es solo un nombre de archivo ("28909_foto.jpg") sin carpetas,
+            // forzamos la ruta oficial de sistema.alaluf.com
+            let cleanLink = link.startsWith('/') ? link.substring(1) : link;
+            if (!cleanLink.includes('/')) {
+                return `${SISTEMA_URL_ALALUF}/nuevo/uploads/${cleanLink}`;
             }
 
-            // Ahora la validación funcionará independientemente del endpoint
-            if (link.startsWith('/nuevo')) {
-                return `${SISTEMA_URL_ALALUF}${link}`;
+            if (!link.startsWith('/')) link = '/' + link;
+
+            if (link.startsWith('/nuevo') || link.startsWith('/uploads')) {
+                let finalPath = link.startsWith('/uploads') ? '/nuevo' + link : link;
+                return `${SISTEMA_URL_ALALUF}${finalPath}`;
             }
             return `${BASE_URL_ALALUF}${link}`;
         }).filter(f => f !== null)
@@ -68,15 +72,17 @@ const mapearPropiedad = (prop) => {
     const lat = parseFloat(prop.latitud);
     const lng = parseFloat(prop.longitud);
 
+    // Función para extraer datos ocultos (Baños, Privados, Superficie)
+    const extraerCampo = (labelDeseado) => {
+        if (!prop.campos_especificos || !Array.isArray(prop.campos_especificos)) return null;
+        const campo = prop.campos_especificos.find(c => c.label.toLowerCase().includes(labelDeseado.toLowerCase()));
+        return campo && campo.value !== null ? campo.value : null;
+    };
+
     return {
         id: prop.id_propiedad,          
-        
-        // 🎯 AQUI ESTÁ LA MEJORA: 'codigo_propiedad' (buscador general) o 'codigo_interno' (ficha individual)
         codigo: prop.codigo_propiedad || prop.codigo_interno || prop.id_propiedad,    
-        
-        // 🎯 AQUI ESTÁ LA MEJORA: 'desc_tipo_prop' (buscador general) o 'desc_tipo' (ficha individual)
         titulo: prop.desc_tipo_prop || prop.desc_tipo || "Propiedad",
-        
         operacion: prop.desc_obj || "Venta / Arriendo",
         ubicacion: {
             comuna: prop.com_nombre || prop.comuna || "Sin Comuna",
@@ -93,11 +99,11 @@ const mapearPropiedad = (prop) => {
             arriendo: { valor: prop.valor_arriendo && prop.valor_arriendo !== "0" ? prop.valor_arriendo : null, moneda: prop.moneda_arriendo || "UF/m2" }
         },
         detalles: {
-            superficie: parseFloat(prop.m2_utiles || prop.m2_construidos || prop.m2_terreno) || 0,
-            banos: parseInt(prop.banos) || 0,
-            dormitorios: parseInt(prop.dormitorios) || 0,
-            privados: parseInt(prop.privados) || 0,
-            estacionamientos: parseInt(prop.estacionamientos) || 0,
+            superficie: parseFloat(prop.m2_utiles || prop.m2_construidos || prop.m2_terreno || extraerCampo("m² Construidos") || extraerCampo("m² Útiles")) || 0,
+            banos: parseInt(prop.banos || extraerCampo("Baños")) || 0,
+            dormitorios: parseInt(prop.dormitorios || extraerCampo("Dormitorios") || extraerCampo("Habitaciones")) || 0,
+            privados: parseInt(prop.privados || extraerCampo("Privados")) || 0,
+            estacionamientos: parseInt(prop.estacionamientos || extraerCampo("Estacionamientos")) || 0,
             descripcion: prop.caracteristicas_internet || prop.observaciones || ""
         },
         imagenes: imagenesProcesadas
@@ -108,31 +114,49 @@ const mapearPropiedad = (prop) => {
 
 router.get('/buscar', async (req, res) => {
     try {
-        const response = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, { params: req.query });
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 10;
+
+        const alalufQuery = { ...req.query };
+        delete alalufQuery.page;
+        delete alalufQuery.limit;
+
+        const response = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, { params: alalufQuery });
         const rawDataArray = response.data?.data || [];
 
-        const propiedadesProcesadas = await Promise.all(rawDataArray.map(async (prop) => {
+        const totalItems = rawDataArray.length;
+        const totalPages = Math.ceil(totalItems / limit);
+        const startIndex = (page - 1) * limit;
+        const endIndex = page * limit;
+
+        const propiedadesDeEstaPagina = rawDataArray.slice(startIndex, endIndex);
+        const propiedadesProcesadas = [];
+
+        for (const prop of propiedadesDeEstaPagina) {
             let mapeada = mapearPropiedad(prop);
 
-            // 🌟 NUEVA MAGIA: Si la propiedad viene sin fotos desde res.php, 
-            // consultamos rápidamente su ficha individual para extraerlas.
             if (mapeada.imagenes.length === 0) {
                 try {
+                    // Restauramos la búsqueda por el ID real de la base de datos
                     const fichaResp = await alalufAxios.get(`${BASE_URL_ALALUF}/api/propiedad.php`, {
-                        params: { id_propiedad: prop.id_propiedad } // Usamos el ID para buscarla
+                        params: { id_propiedad: prop.id_propiedad } 
                     });
                     
                     if (fichaResp.data && fichaResp.data.data) {
-                        // Reutilizamos tu propia función para mapear las fotos correctamente
                         const fichaCompleta = mapearPropiedad(fichaResp.data.data);
                         mapeada.imagenes = fichaCompleta.imagenes; 
                     }
                 } catch (error) {
-                    console.error(`❌ [FOTO ERROR]: No se pudieron cargar fotos para ID ${prop.id_propiedad}`);
+                    console.error(`❌ [FOTO ERROR]: Falló rescate para ID ${prop.id_propiedad}`);
                 }
+                await delay(200); 
             }
 
-            // Geocodificación (tu código original intacto)
+            // Para las cards mostramos solo la foto principal
+            if (mapeada.imagenes.length > 0) {
+                mapeada.imagenes = [mapeada.imagenes[0]];
+            }
+
             if (!mapeada.coords.lat || !mapeada.coords.lng) {
                 const calle = (prop.direccion || "").trim();
                 const comuna = (prop.com_nombre || "").trim();
@@ -142,25 +166,29 @@ router.get('/buscar', async (req, res) => {
                 }
             }
             
-            return mapeada;
-        }));
+            propiedadesProcesadas.push(mapeada);
+        }
         
-        res.json(propiedadesProcesadas);
+        res.json({
+            data: propiedadesProcesadas,
+            paginacion: {
+                totalPropiedades: totalItems,
+                paginaActual: page,
+                totalPaginas: totalPages,
+                propiedadesPorPagina: limit
+            }
+        });
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: "Error en el servidor de búsqueda" });
     }
 });
 
-/**
- * RUTA MEJORADA: Soporta ID (447) y Código (18870)
- */
 router.get('/:id', async (req, res) => {
     const term = req.params.id;
     let rawData = null;
 
     try {
-        // Intento 1: Ficha directa
         const responseDirecta = await alalufAxios.get(`${BASE_URL_ALALUF}/api/propiedad.php`, {
             params: { id_propiedad: term }
         });
@@ -169,22 +197,12 @@ router.get('/:id', async (req, res) => {
             rawData = responseDirecta.data.data;
         }
 
-        // Intento 2: Rescate si la directa falló (404 o sin data)
         if (!rawData) {
-            const responseBusqueda = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, {
-                params: { q: term }
-            });
-
+            const responseBusqueda = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, { params: { q: term } });
             const resultados = responseBusqueda.data?.data || [];
-            
-            // Buscamos coincidencia exacta por ID o por Código Interno
-            const match = resultados.find(p => 
-                p.id_propiedad == term || 
-                p.codigo_interno == term
-            );
+            const match = resultados.find(p => p.id_propiedad == term || p.codigo_interno == term);
 
             if (match) {
-                // Re-intentamos la ficha usando el ID que la API reconoció en la búsqueda
                 const retryResponse = await alalufAxios.get(`${BASE_URL_ALALUF}/api/propiedad.php`, {
                     params: { id_propiedad: match.id_propiedad }
                 });
@@ -196,7 +214,6 @@ router.get('/:id', async (req, res) => {
 
         let mapeada = mapearPropiedad(rawData);
 
-        // Geocodificación fallback
         if (!mapeada.coords.lat || !mapeada.coords.lng) {
             const direccion = `${rawData.direccion || ''}, ${rawData.com_nombre || ''}, Chile`;
             const coords = await obtenerCoordenadas(direccion);
@@ -204,9 +221,7 @@ router.get('/:id', async (req, res) => {
         }
 
         res.json(mapeada);
-
     } catch (error) {
-        console.error(`💥 [ERROR]: ${error.message}`);
         res.status(500).json({ error: "Error interno del servidor" });
     }
 });
