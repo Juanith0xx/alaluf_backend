@@ -2,45 +2,21 @@ const express = require('express');
 const router = express.Router();
 const axios = require('axios');
 
-// Configuración de Axios
 const alalufAxios = axios.create({
     headers: {
         'X-API-KEY': process.env.ALALUF_API_KEY,
         'User-Agent': 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'application/json'
     },
-    timeout: 30000,
+    timeout: 15000, // Bajamos el timeout para no colgar el proceso
     validateStatus: (status) => status < 500 
 });
 
 const BASE_URL_ALALUF = "https://alaluf.cl";
 const SISTEMA_URL_ALALUF = "https://sistema.alaluf.com"; 
 
-// ⏱️ FUNCION PARA EVITAR BLOQUEOS DEL SERVIDOR
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
-
-const obtenerCoordenadas = async (direccion) => {
-    const token = process.env.MAPBOX_TOKEN || process.env.VITE_MAPBOX_TOKEN;
-    if (!token) return null;
-
-    try {
-        const query = encodeURIComponent(direccion);
-        const url = `https://api.mapbox.com/geocoding/v5/mapbox.places/${query}.json?access_token=${token}&limit=1&country=cl`;
-        const resp = await axios.get(url, { timeout: 5000 });
-
-        if (resp.data.features && resp.data.features.length > 0) {
-            const [lng, lat] = resp.data.features[0].center;
-            return { lat, lng };
-        }
-    } catch (error) {
-        console.error(`❌ [GEOCODE ERROR]: ${direccion}`);
-    }
-    return null;
-};
-
 const mapearPropiedad = (prop) => {
     let fotosRaw = prop.foto_principal || prop.fotos || prop.foto || prop.foto_portada || prop.imagen || prop.path_foto || prop.img_1 || [];
-    
     if (typeof fotosRaw === 'string' && fotosRaw.length > 0) {
         fotosRaw = fotosRaw.includes(',') ? fotosRaw.split(',') : [fotosRaw];
     }
@@ -50,17 +26,9 @@ const mapearPropiedad = (prop) => {
             if (!f || typeof f !== 'string') return null;
             let link = f.trim();
             if (link.startsWith('http')) return link;
-            
-            // 🚨 SOLUCIÓN AL BUG DE LAS FOTOS 🚨
-            // Si el link es solo un nombre de archivo ("28909_foto.jpg") sin carpetas,
-            // forzamos la ruta oficial de sistema.alaluf.com
             let cleanLink = link.startsWith('/') ? link.substring(1) : link;
-            if (!cleanLink.includes('/')) {
-                return `${SISTEMA_URL_ALALUF}/nuevo/uploads/${cleanLink}`;
-            }
-
+            if (!cleanLink.includes('/')) return `${SISTEMA_URL_ALALUF}/nuevo/uploads/${cleanLink}`;
             if (!link.startsWith('/')) link = '/' + link;
-
             if (link.startsWith('/nuevo') || link.startsWith('/uploads')) {
                 let finalPath = link.startsWith('/uploads') ? '/nuevo' + link : link;
                 return `${SISTEMA_URL_ALALUF}${finalPath}`;
@@ -72,7 +40,6 @@ const mapearPropiedad = (prop) => {
     const lat = parseFloat(prop.latitud);
     const lng = parseFloat(prop.longitud);
 
-    // Función para extraer datos ocultos (Baños, Privados, Superficie)
     const extraerCampo = (labelDeseado) => {
         if (!prop.campos_especificos || !Array.isArray(prop.campos_especificos)) return null;
         const campo = prop.campos_especificos.find(c => c.label.toLowerCase().includes(labelDeseado.toLowerCase()));
@@ -104,19 +71,18 @@ const mapearPropiedad = (prop) => {
             dormitorios: parseInt(prop.dormitorios || extraerCampo("Dormitorios") || extraerCampo("Habitaciones")) || 0,
             privados: parseInt(prop.privados || extraerCampo("Privados")) || 0,
             estacionamientos: parseInt(prop.estacionamientos || extraerCampo("Estacionamientos")) || 0,
+            caracteristicasExtra: prop.campos_especificos || [], // Enviamos esto para la lógica de la card
             descripcion: prop.caracteristicas_internet || prop.observaciones || ""
         },
         imagenes: imagenesProcesadas
     };
 };
 
-// --- RUTAS ---
-
+// --- RUTA BUSCAR OPTIMIZADA ---
 router.get('/buscar', async (req, res) => {
     try {
         const page = parseInt(req.query.page) || 1;
         const limit = parseInt(req.query.limit) || 10;
-
         const alalufQuery = { ...req.query };
         delete alalufQuery.page;
         delete alalufQuery.limit;
@@ -127,50 +93,39 @@ router.get('/buscar', async (req, res) => {
         const totalItems = rawDataArray.length;
         const totalPages = Math.ceil(totalItems / limit);
         const startIndex = (page - 1) * limit;
-        const endIndex = page * limit;
+        const propiedadesDeEstaPagina = rawDataArray.slice(startIndex, startIndex + limit);
 
-        const propiedadesDeEstaPagina = rawDataArray.slice(startIndex, endIndex);
-        const propiedadesProcesadas = [];
-
-        for (const prop of propiedadesDeEstaPagina) {
+        // 🚀 PROCESAMIENTO EN PARALELO (Turbo Mode)
+        const promesas = propiedadesDeEstaPagina.map(async (prop) => {
             let mapeada = mapearPropiedad(prop);
 
-            if (mapeada.imagenes.length === 0) {
+            // Si faltan fotos o coordenadas, disparamos el rescate
+            if (mapeada.imagenes.length === 0 || !mapeada.coords.lat) {
                 try {
-                    // Restauramos la búsqueda por el ID real de la base de datos
+                    // Usamos Promise.race para ponerle un tope de tiempo a cada rescate individual
                     const fichaResp = await alalufAxios.get(`${BASE_URL_ALALUF}/api/propiedad.php`, {
-                        params: { id_propiedad: prop.id_propiedad } 
+                        params: { id_propiedad: mapeada.codigo },
+                        timeout: 4000 // Si una ficha tarda más de 4s, la ignoramos
                     });
-                    
-                    if (fichaResp.data && fichaResp.data.data) {
+
+                    if (fichaResp.data?.data) {
                         const fichaCompleta = mapearPropiedad(fichaResp.data.data);
-                        mapeada.imagenes = fichaCompleta.imagenes; 
+                        if (mapeada.imagenes.length === 0) mapeada.imagenes = fichaCompleta.imagenes;
+                        if (!mapeada.coords.lat) mapeada.coords = fichaCompleta.coords;
+                        // También rescatamos los detalles técnicos para tu nueva card
+                        mapeada.detalles = fichaCompleta.detalles;
                     }
-                } catch (error) {
-                    console.error(`❌ [FOTO ERROR]: Falló rescate para ID ${prop.id_propiedad}`);
-                }
-                await delay(200); 
-            }
-
-            // Para las cards mostramos solo la foto principal
-            if (mapeada.imagenes.length > 0) {
-                mapeada.imagenes = [mapeada.imagenes[0]];
-            }
-
-            if (!mapeada.coords.lat || !mapeada.coords.lng) {
-                const calle = (prop.direccion || "").trim();
-                const comuna = (prop.com_nombre || "").trim();
-                if (calle.length > 3) {
-                    const coords = await obtenerCoordenadas(`${calle}, ${comuna}, Chile`);
-                    if (coords) mapeada.coords = coords;
+                } catch (e) {
+                    console.error(`Ficha lenta o error en ID ${mapeada.codigo}`);
                 }
             }
-            
-            propiedadesProcesadas.push(mapeada);
-        }
+            return mapeada;
+        });
+
+        const resultados = await Promise.all(promesas);
         
         res.json({
-            data: propiedadesProcesadas,
+            data: resultados,
             paginacion: {
                 totalPropiedades: totalItems,
                 paginaActual: page,
@@ -180,50 +135,26 @@ router.get('/buscar', async (req, res) => {
         });
     } catch (error) {
         console.error(error);
-        res.status(500).json({ error: "Error en el servidor de búsqueda" });
+        res.status(500).json({ error: "Error en la búsqueda rápida" });
     }
 });
 
+// Ruta individual (se mantiene igual de robusta)
 router.get('/:id', async (req, res) => {
     const term = req.params.id;
-    let rawData = null;
-
     try {
-        const responseDirecta = await alalufAxios.get(`${BASE_URL_ALALUF}/api/propiedad.php`, {
-            params: { id_propiedad: term }
-        });
+        const response = await alalufAxios.get(`${BASE_URL_ALALUF}/api/propiedad.php`, { params: { id_propiedad: term } });
+        if (response.data?.data) return res.json(mapearPropiedad(response.data.data));
         
-        if (responseDirecta.status === 200 && responseDirecta.data?.data) {
-            rawData = responseDirecta.data.data;
+        // Fallback por si el ID no es el directo
+        const search = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, { params: { q: term } });
+        const match = (search.data?.data || []).find(p => p.id_propiedad == term || p.codigo_interno == term);
+        if (match) {
+            const retry = await alalufAxios.get(`${BASE_URL_ALALUF}/api/propiedad.php`, { params: { id_propiedad: match.id_propiedad } });
+            return res.json(mapearPropiedad(retry.data.data));
         }
-
-        if (!rawData) {
-            const responseBusqueda = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, { params: { q: term } });
-            const resultados = responseBusqueda.data?.data || [];
-            const match = resultados.find(p => p.id_propiedad == term || p.codigo_interno == term);
-
-            if (match) {
-                const retryResponse = await alalufAxios.get(`${BASE_URL_ALALUF}/api/propiedad.php`, {
-                    params: { id_propiedad: match.id_propiedad }
-                });
-                rawData = retryResponse.data?.data;
-            }
-        }
-
-        if (!rawData) return res.status(404).json({ error: "Propiedad no encontrada" });
-
-        let mapeada = mapearPropiedad(rawData);
-
-        if (!mapeada.coords.lat || !mapeada.coords.lng) {
-            const direccion = `${rawData.direccion || ''}, ${rawData.com_nombre || ''}, Chile`;
-            const coords = await obtenerCoordenadas(direccion);
-            if (coords) mapeada.coords = coords;
-        }
-
-        res.json(mapeada);
-    } catch (error) {
-        res.status(500).json({ error: "Error interno del servidor" });
-    }
+        res.status(404).json({ error: "No encontrada" });
+    } catch (e) { res.status(500).send("Error"); }
 });
 
 module.exports = router;
