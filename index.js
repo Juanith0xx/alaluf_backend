@@ -9,17 +9,22 @@ const PORT = process.env.PORT || 5000;
 app.use(cors());
 app.use(express.json());
 
-// Rutas
+// Importación de Rutas
 const propiedadesRoutes = require('./routes/propiedades');
-const indicadoresRoutes = require('./routes/indicadores'); // 🌟 Importamos la nueva ruta de la UF
+const indicadoresRoutes = require('./routes/indicadores'); 
+const crmRoutes = require('./routes/crm.routes');
 
+// Montaje de Rutas
 app.use('/api/propiedades', propiedadesRoutes);
-app.use('/api/indicadores', indicadoresRoutes); // 🌟 Montamos el endpoint para el indicador económico
+app.use('/api/indicadores', indicadoresRoutes); 
+app.use('/api', crmRoutes);
 
+// Ruta raíz de comprobación
 app.get('/', (req, res) => {
     res.send('Servidor Alaluf Bridge operativo 🚀');
 });
 
+// Iniciar servidor
 app.listen(PORT, () => {
     console.log(`Servidor corriendo en http://localhost:${PORT}`);
 });
