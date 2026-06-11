@@ -1,6 +1,12 @@
 const express = require('express');
 const router = express.Router();
 const axios = require('axios');
+const NodeCache = require('node-cache');
+
+// 🚀 Caché en memoria: guarda búsquedas por 10 minutos (600 segundos)
+// y los detalles individuales por 30 minutos (1800 segundos)
+const searchCache = new NodeCache({ stdTTL: 600 });
+const detailCache = new NodeCache({ stdTTL: 1800 });
 
 const alalufAxios = axios.create({
     headers: {
@@ -79,109 +85,100 @@ const mapearPropiedad = (prop) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-// RUTA BUSCAR
-// Usa limit + offset nativos de Alaluf para obtener TODOS los resultados,
-// luego aplica paginación propia para el frontend.
+// RUTA BUSCAR OPTIMIZADA
 // ─────────────────────────────────────────────────────────────
 router.get('/buscar', async (req, res) => {
     try {
         const page  = parseInt(req.query.page)  || 1;
         const limit = parseInt(req.query.limit) || 10;
 
-        // Parámetros que van a Alaluf (limpiamos los nuestros)
         const alalufQuery = { ...req.query };
         delete alalufQuery.page;
         delete alalufQuery.limit;
 
-        // La API de Alaluf acepta "obj" directamente (no "objetivo")
-        console.log("── QUERY ENVIADA A ALALUF:", alalufQuery);
+        // 🚀 Generamos un identificador único para los parámetros de búsqueda exactos
+        const cacheKey = JSON.stringify(alalufQuery);
+        let rawDataArray = searchCache.get(cacheKey);
 
-        // ── PASO 1: Primera página con offset=0 ─────────────────────────
-        const firstResponse = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, {
-            params: { ...alalufQuery, limit: 50, offset: 0 }
-        });
+        // Solo vamos a la API externa si la búsqueda no está en caché
+        if (!rawDataArray) {
+            console.log("── NO EN CACHÉ. DESCARGANDO DESDE ALALUF:", alalufQuery);
+            
+            const firstResponse = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, {
+                params: { ...alalufQuery, limit: 50, offset: 0 }
+            });
 
-        const firstData    = firstResponse.data?.data || [];
-        const totalReportado = firstResponse.data?.total 
-            || firstResponse.data?.total_registros
-            || firstResponse.data?.count
-            || null;
+            const firstData = firstResponse.data?.data || [];
+            rawDataArray = [...firstData];
 
-        console.log(`Primera página: ${firstData.length} props | Total API: ${totalReportado ?? "no reportado"}`);
+            if (firstData.length === 50) {
+                let offset = 50;
+                let hayMas = true;
+                const idsVistos = new Set(firstData.map(p => p.id_propiedad || p.codigo_interno));
 
-        let rawDataArray = [...firstData];
+                while (hayMas && offset <= 5000) {
+                    const resp = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, {
+                        params: { ...alalufQuery, limit: 50, offset }
+                    }).catch(() => null);
 
-        // ── PASO 2: Seguimos con offset=50, 100, 150... hasta agotar ────
-        if (firstData.length === 50) {
-            let offset   = 50;
-            let hayMas   = true;
-            const idsVistos = new Set(firstData.map(p => p.id_propiedad || p.codigo_interno));
+                    const data = resp?.data?.data || [];
+                    
+                    if (data.length === 0) break;
 
-            while (hayMas && offset <= 5000) { // tope de seguridad: 5000 props
-                const resp = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, {
-                    params: { ...alalufQuery, limit: 50, offset }
-                }).catch(err => {
-                    console.error(`Error en offset ${offset}:`, err.message);
-                    return null;
-                });
+                    const nuevos = data.filter(p => !idsVistos.has(p.id_propiedad || p.codigo_interno));
+                    if (nuevos.length === 0) break;
 
-                const data = resp?.data?.data || [];
-                console.log(`offset=${offset}: ${data.length} props`);
+                    nuevos.forEach(p => {
+                        idsVistos.add(p.id_propiedad || p.codigo_interno);
+                        rawDataArray.push(p);
+                    });
 
-                // Fin: página vacía
-                if (data.length === 0) {
-                    hayMas = false;
-                    break;
+                    if (data.length < 50) hayMas = false;
+                    offset += 50;
                 }
-
-                // Fin: todos los IDs ya los teníamos (API ciclando)
-                const nuevos = data.filter(p => !idsVistos.has(p.id_propiedad || p.codigo_interno));
-                if (nuevos.length === 0) {
-                    console.log("Todos duplicados → fin real de datos.");
-                    hayMas = false;
-                    break;
-                }
-
-                nuevos.forEach(p => {
-                    idsVistos.add(p.id_propiedad || p.codigo_interno);
-                    rawDataArray.push(p);
-                });
-
-                // Fin: página incompleta → era la última
-                if (data.length < 50) {
-                    hayMas = false;
-                }
-
-                offset += 50;
             }
+            
+            // 🚀 Guardamos el arreglo masivo en memoria para las próximas peticiones
+            searchCache.set(cacheKey, rawDataArray);
+            console.log(`TOTAL DESCARGADO Y GUARDADO EN CACHÉ: ${rawDataArray.length}`);
+        } else {
+            console.log(`── SIRVIENDO DESDE CACHÉ: ${rawDataArray.length} propiedades encontradas`);
         }
 
-        console.log(`TOTAL ACUMULADO: ${rawDataArray.length} propiedades`);
-
-        // ── PASO 3: Paginación propia para el frontend ───────────────────
+        // Paginación sobre el arreglo (sea de caché o recién descargado)
         const totalItems = rawDataArray.length;
         const totalPages = Math.ceil(totalItems / limit);
         const startIndex = (page - 1) * limit;
         const propiedadesDeEstaPagina = rawDataArray.slice(startIndex, startIndex + limit);
 
-        // ── PASO 4: Enriquecer con fotos / coords ────────────────────────
+        // Enriquecer con fotos / coords optimizado con caché individual
         const promesas = propiedadesDeEstaPagina.map(async (prop) => {
             let mapeada = mapearPropiedad(prop);
 
             if (mapeada.imagenes.length === 0 || !mapeada.coords.lat) {
-                try {
-                    const fichaResp = await alalufAxios.get(`${BASE_URL_ALALUF}/api/propiedad.php`, {
-                        params: { id_propiedad: mapeada.codigo },
-                        timeout: 4000
-                    });
-                    if (fichaResp.data?.data) {
-                        const fichaCompleta = mapearPropiedad(fichaResp.data.data);
-                        if (mapeada.imagenes.length === 0) mapeada.imagenes = fichaCompleta.imagenes;
-                        if (!mapeada.coords.lat) mapeada.coords = fichaCompleta.coords;
-                        mapeada.detalles = fichaCompleta.detalles;
+                // 🚀 Revisar si ya tenemos la ficha guardada
+                const fichaCacheKey = `ficha_${mapeada.codigo}`;
+                let fichaCompleta = detailCache.get(fichaCacheKey);
+
+                if (!fichaCompleta) {
+                    try {
+                        const fichaResp = await alalufAxios.get(`${BASE_URL_ALALUF}/api/propiedad.php`, {
+                            params: { id_propiedad: mapeada.codigo },
+                            timeout: 4000
+                        });
+                        if (fichaResp.data?.data) {
+                            fichaCompleta = mapearPropiedad(fichaResp.data.data);
+                            detailCache.set(fichaCacheKey, fichaCompleta); // Guardar en caché
+                        }
+                    } catch (e) {
+                        console.error(`Error obteniendo ID ${mapeada.codigo}`);
                     }
-                } catch (e) {
-                    console.error(`Ficha lenta o error en ID ${mapeada.codigo}`);
+                }
+
+                if (fichaCompleta) {
+                    if (mapeada.imagenes.length === 0) mapeada.imagenes = fichaCompleta.imagenes;
+                    if (!mapeada.coords.lat) mapeada.coords = fichaCompleta.coords;
+                    mapeada.detalles = fichaCompleta.detalles;
                 }
             }
             return mapeada;
@@ -201,24 +198,36 @@ router.get('/buscar', async (req, res) => {
 
     } catch (error) {
         console.error("Error en /buscar:", error);
-        res.status(500).json({ error: "Error en la búsqueda rápida" });
+        res.status(500).json({ error: "Error interno del servidor" });
     }
 });
 
 // ─────────────────────────────────────────────────────────────
-// RUTA INDIVIDUAL por ID / código
+// RUTA INDIVIDUAL (También cacheada)
 // ─────────────────────────────────────────────────────────────
 router.get('/:id', async (req, res) => {
     const term = req.params.id;
+    const cacheKey = `ficha_endpoint_${term}`;
+    
+    // 🚀 Intentar recuperar de caché
+    const cachedResponse = detailCache.get(cacheKey);
+    if (cachedResponse) return res.json(cachedResponse);
+
     try {
         const response = await alalufAxios.get(`${BASE_URL_ALALUF}/api/propiedad.php`, { params: { id_propiedad: term } });
-        if (response.data?.data) return res.json(mapearPropiedad(response.data.data));
+        if (response.data?.data) {
+            const dataMapeada = mapearPropiedad(response.data.data);
+            detailCache.set(cacheKey, dataMapeada);
+            return res.json(dataMapeada);
+        }
         
         const search = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, { params: { q: term } });
         const match = (search.data?.data || []).find(p => p.id_propiedad == term || p.codigo_interno == term);
         if (match) {
             const retry = await alalufAxios.get(`${BASE_URL_ALALUF}/api/propiedad.php`, { params: { id_propiedad: match.id_propiedad } });
-            return res.json(mapearPropiedad(retry.data.data));
+            const dataRetry = mapearPropiedad(retry.data.data);
+            detailCache.set(cacheKey, dataRetry);
+            return res.json(dataRetry);
         }
         res.status(404).json({ error: "No encontrada" });
     } catch (e) {
