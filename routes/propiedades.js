@@ -8,7 +8,7 @@ const alalufAxios = axios.create({
         'User-Agent': 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'application/json'
     },
-    timeout: 15000, // Bajamos el timeout para no colgar el proceso
+    timeout: 15000,
     validateStatus: (status) => status < 500 
 });
 
@@ -71,48 +71,113 @@ const mapearPropiedad = (prop) => {
             dormitorios: parseInt(prop.dormitorios || extraerCampo("Dormitorios") || extraerCampo("Habitaciones")) || 0,
             privados: parseInt(prop.privados || extraerCampo("Privados")) || 0,
             estacionamientos: parseInt(prop.estacionamientos || extraerCampo("Estacionamientos")) || 0,
-            caracteristicasExtra: prop.campos_especificos || [], // Enviamos esto para la lógica de la card
+            caracteristicasExtra: prop.campos_especificos || [],
             descripcion: prop.caracteristicas_internet || prop.observaciones || ""
         },
         imagenes: imagenesProcesadas
     };
 };
 
-// --- RUTA BUSCAR OPTIMIZADA ---
+// ─────────────────────────────────────────────────────────────
+// RUTA BUSCAR
+// Usa limit + offset nativos de Alaluf para obtener TODOS los resultados,
+// luego aplica paginación propia para el frontend.
+// ─────────────────────────────────────────────────────────────
 router.get('/buscar', async (req, res) => {
     try {
-        const page = parseInt(req.query.page) || 1;
+        const page  = parseInt(req.query.page)  || 1;
         const limit = parseInt(req.query.limit) || 10;
+
+        // Parámetros que van a Alaluf (limpiamos los nuestros)
         const alalufQuery = { ...req.query };
         delete alalufQuery.page;
         delete alalufQuery.limit;
 
-        const response = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, { params: alalufQuery });
-        const rawDataArray = response.data?.data || [];
+        // La API de Alaluf acepta "obj" directamente (no "objetivo")
+        console.log("── QUERY ENVIADA A ALALUF:", alalufQuery);
 
+        // ── PASO 1: Primera página con offset=0 ─────────────────────────
+        const firstResponse = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, {
+            params: { ...alalufQuery, limit: 50, offset: 0 }
+        });
+
+        const firstData    = firstResponse.data?.data || [];
+        const totalReportado = firstResponse.data?.total 
+            || firstResponse.data?.total_registros
+            || firstResponse.data?.count
+            || null;
+
+        console.log(`Primera página: ${firstData.length} props | Total API: ${totalReportado ?? "no reportado"}`);
+
+        let rawDataArray = [...firstData];
+
+        // ── PASO 2: Seguimos con offset=50, 100, 150... hasta agotar ────
+        if (firstData.length === 50) {
+            let offset   = 50;
+            let hayMas   = true;
+            const idsVistos = new Set(firstData.map(p => p.id_propiedad || p.codigo_interno));
+
+            while (hayMas && offset <= 5000) { // tope de seguridad: 5000 props
+                const resp = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, {
+                    params: { ...alalufQuery, limit: 50, offset }
+                }).catch(err => {
+                    console.error(`Error en offset ${offset}:`, err.message);
+                    return null;
+                });
+
+                const data = resp?.data?.data || [];
+                console.log(`offset=${offset}: ${data.length} props`);
+
+                // Fin: página vacía
+                if (data.length === 0) {
+                    hayMas = false;
+                    break;
+                }
+
+                // Fin: todos los IDs ya los teníamos (API ciclando)
+                const nuevos = data.filter(p => !idsVistos.has(p.id_propiedad || p.codigo_interno));
+                if (nuevos.length === 0) {
+                    console.log("Todos duplicados → fin real de datos.");
+                    hayMas = false;
+                    break;
+                }
+
+                nuevos.forEach(p => {
+                    idsVistos.add(p.id_propiedad || p.codigo_interno);
+                    rawDataArray.push(p);
+                });
+
+                // Fin: página incompleta → era la última
+                if (data.length < 50) {
+                    hayMas = false;
+                }
+
+                offset += 50;
+            }
+        }
+
+        console.log(`TOTAL ACUMULADO: ${rawDataArray.length} propiedades`);
+
+        // ── PASO 3: Paginación propia para el frontend ───────────────────
         const totalItems = rawDataArray.length;
         const totalPages = Math.ceil(totalItems / limit);
         const startIndex = (page - 1) * limit;
         const propiedadesDeEstaPagina = rawDataArray.slice(startIndex, startIndex + limit);
 
-        // 🚀 PROCESAMIENTO EN PARALELO (Turbo Mode)
+        // ── PASO 4: Enriquecer con fotos / coords ────────────────────────
         const promesas = propiedadesDeEstaPagina.map(async (prop) => {
             let mapeada = mapearPropiedad(prop);
 
-            // Si faltan fotos o coordenadas, disparamos el rescate
             if (mapeada.imagenes.length === 0 || !mapeada.coords.lat) {
                 try {
-                    // Usamos Promise.race para ponerle un tope de tiempo a cada rescate individual
                     const fichaResp = await alalufAxios.get(`${BASE_URL_ALALUF}/api/propiedad.php`, {
                         params: { id_propiedad: mapeada.codigo },
-                        timeout: 4000 // Si una ficha tarda más de 4s, la ignoramos
+                        timeout: 4000
                     });
-
                     if (fichaResp.data?.data) {
                         const fichaCompleta = mapearPropiedad(fichaResp.data.data);
                         if (mapeada.imagenes.length === 0) mapeada.imagenes = fichaCompleta.imagenes;
                         if (!mapeada.coords.lat) mapeada.coords = fichaCompleta.coords;
-                        // También rescatamos los detalles técnicos para tu nueva card
                         mapeada.detalles = fichaCompleta.detalles;
                     }
                 } catch (e) {
@@ -123,7 +188,7 @@ router.get('/buscar', async (req, res) => {
         });
 
         const resultados = await Promise.all(promesas);
-        
+
         res.json({
             data: resultados,
             paginacion: {
@@ -133,20 +198,22 @@ router.get('/buscar', async (req, res) => {
                 propiedadesPorPagina: limit
             }
         });
+
     } catch (error) {
-        console.error(error);
+        console.error("Error en /buscar:", error);
         res.status(500).json({ error: "Error en la búsqueda rápida" });
     }
 });
 
-// Ruta individual (se mantiene igual de robusta)
+// ─────────────────────────────────────────────────────────────
+// RUTA INDIVIDUAL por ID / código
+// ─────────────────────────────────────────────────────────────
 router.get('/:id', async (req, res) => {
     const term = req.params.id;
     try {
         const response = await alalufAxios.get(`${BASE_URL_ALALUF}/api/propiedad.php`, { params: { id_propiedad: term } });
         if (response.data?.data) return res.json(mapearPropiedad(response.data.data));
         
-        // Fallback por si el ID no es el directo
         const search = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, { params: { q: term } });
         const match = (search.data?.data || []).find(p => p.id_propiedad == term || p.codigo_interno == term);
         if (match) {
@@ -154,7 +221,9 @@ router.get('/:id', async (req, res) => {
             return res.json(mapearPropiedad(retry.data.data));
         }
         res.status(404).json({ error: "No encontrada" });
-    } catch (e) { res.status(500).send("Error"); }
+    } catch (e) {
+        res.status(500).send("Error");
+    }
 });
 
 module.exports = router;
