@@ -85,7 +85,7 @@ const mapearPropiedad = (prop) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-// RUTA BUSCAR OPTIMIZADA
+// RUTA BUSCAR OPTIMIZADA CON FILTROS HORIZONTALES
 // ─────────────────────────────────────────────────────────────
 router.get('/buscar', async (req, res) => {
     try {
@@ -96,16 +96,26 @@ router.get('/buscar', async (req, res) => {
         delete alalufQuery.page;
         delete alalufQuery.limit;
 
-        // 🚀 Generamos un identificador único para los parámetros de búsqueda exactos
-        const cacheKey = JSON.stringify(alalufQuery);
+        // Limpiamos los parámetros de filtros horizontales para realizar una petición base al origen
+        const apiQuery = { ...alalufQuery };
+        delete apiQuery.comuna;
+        delete apiQuery.sup_desde;
+        delete apiQuery.sup_hasta;
+        delete apiQuery.precio_desde;
+        delete apiQuery.precio_hasta;
+        delete apiQuery.moneda;
+        delete apiQuery.orden;
+
+        // 🚀 Generamos un identificador único para los parámetros de búsqueda base exactos
+        const cacheKey = JSON.stringify(apiQuery);
         let rawDataArray = searchCache.get(cacheKey);
 
         // Solo vamos a la API externa si la búsqueda no está en caché
         if (!rawDataArray) {
-            console.log("── NO EN CACHÉ. DESCARGANDO DESDE ALALUF:", alalufQuery);
+            console.log("── NO EN CACHÉ. DESCARGANDO DESDE ALALUF:", apiQuery);
             
             const firstResponse = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, {
-                params: { ...alalufQuery, limit: 50, offset: 0 }
+                params: { ...apiQuery, limit: 50, offset: 0 }
             });
 
             const firstData = firstResponse.data?.data || [];
@@ -118,7 +128,7 @@ router.get('/buscar', async (req, res) => {
 
                 while (hayMas && offset <= 5000) {
                     const resp = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, {
-                        params: { ...alalufQuery, limit: 50, offset }
+                        params: { ...apiQuery, limit: 50, offset }
                     }).catch(() => null);
 
                     const data = resp?.data?.data || [];
@@ -145,16 +155,58 @@ router.get('/buscar', async (req, res) => {
             console.log(`── SIRVIENDO DESDE CACHÉ: ${rawDataArray.length} propiedades encontradas`);
         }
 
-        // Paginación sobre el arreglo (sea de caché o recién descargado)
-        const totalItems = rawDataArray.length;
+        // 🌟 MAPEO E INTEGRACIÓN DE FILTROS HORIZONTALES AVANZADOS 🌟
+        let mappedItems = rawDataArray.map(prop => mapearPropiedad(prop));
+
+        // Aplicar filtros en memoria
+        const fComuna = req.query.comuna;
+        const fSupDesde = parseFloat(req.query.sup_desde);
+        const fSupHasta = parseFloat(req.query.sup_hasta);
+        const fPrecioDesde = parseFloat(req.query.precio_desde);
+        const fPrecioHasta = parseFloat(req.query.precio_hasta);
+        const fOrden = req.query.orden || 'desc'; // 'desc' mayor a menor, 'asc' menor a mayor
+
+        mappedItems = mappedItems.filter(item => {
+            let match = true;
+            if (fComuna) {
+                match = match && item.ubicacion.comuna.toLowerCase().includes(fComuna.toLowerCase());
+            }
+            if (!isNaN(fSupDesde)) {
+                match = match && item.detalles.superficie >= fSupDesde;
+            }
+            if (!isNaN(fSupHasta)) {
+                match = match && item.detalles.superficie <= fSupHasta;
+            }
+            if (!isNaN(fPrecioDesde) || !isNaN(fPrecioHasta)) {
+                // Comprobamos el precio en venta o arriendo indistintamente
+                const valVenta = parseFloat(item.precios.venta.valor || 0);
+                const valArriendo = parseFloat(item.precios.arriendo.valor || 0);
+                const valorMax = Math.max(valVenta, valArriendo);
+                
+                if (!isNaN(fPrecioDesde)) match = match && valorMax >= fPrecioDesde;
+                if (!isNaN(fPrecioHasta)) match = match && valorMax <= fPrecioHasta;
+            }
+            return match;
+        });
+
+        // Ordenamiento dinámico
+        mappedItems.sort((a, b) => {
+            const getPrice = (item) => {
+                const valVenta = parseFloat(item.precios.venta.valor || 0);
+                const valArriendo = parseFloat(item.precios.arriendo.valor || 0);
+                return Math.max(valVenta, valArriendo);
+            };
+            return fOrden === 'asc' ? getPrice(a) - getPrice(b) : getPrice(b) - getPrice(a);
+        });
+
+        // Paginación final
+        const totalItems = mappedItems.length;
         const totalPages = Math.ceil(totalItems / limit);
         const startIndex = (page - 1) * limit;
-        const propiedadesDeEstaPagina = rawDataArray.slice(startIndex, startIndex + limit);
+        const propiedadesDeEstaPagina = mappedItems.slice(startIndex, startIndex + limit);
 
         // Enriquecer con fotos / coords optimizado con caché individual
-        const promesas = propiedadesDeEstaPagina.map(async (prop) => {
-            let mapeada = mapearPropiedad(prop);
-
+        const promesas = propiedadesDeEstaPagina.map(async (mapeada) => {
             if (mapeada.imagenes.length === 0 || !mapeada.coords.lat) {
                 // 🚀 Revisar si ya tenemos la ficha guardada
                 const fichaCacheKey = `ficha_${mapeada.codigo}`;
