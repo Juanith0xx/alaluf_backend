@@ -1,6 +1,6 @@
 const express = require('express');
 const cors = require('cors');
-const axios = require('axios'); // 🌟 Añadido para la ruta de diagnóstico
+const axios = require('axios'); // 🌟 Añadido para la ruta de diagnóstico y puentes
 require('dotenv').config();
 
 const app = express();
@@ -14,11 +14,6 @@ app.use(express.json());
 const propiedadesRoutes = require('./routes/propiedades');
 const indicadoresRoutes = require('./routes/indicadores'); 
 const crmRoutes = require('./routes/crm.routes');
-
-// Montaje de Rutas
-app.use('/api/propiedades', propiedadesRoutes);
-app.use('/api/indicadores', indicadoresRoutes); 
-app.use('/api', crmRoutes);
 
 // 🌟 RUTA DE DIAGNÓSTICO DINÁMICA AÑADIDA
 app.get('/api/conteo-tipos', async (req, res) => {
@@ -99,6 +94,100 @@ app.post('/api/save_lead', async (req, res) => {
         }
     }
 });
+
+// 🌟 PUENTE HACIA EL CRM EXTERNO DE PUBLICACIÓN DE PROPIEDADES (HTTPS / save_ep.php)
+// ⚠️ IMPORTANTE: Esta ruta debe ir ANTES de app.use('/api/propiedades', propiedadesRoutes)
+// para evitar que el router capture /api/propiedades/* antes de llegar aquí.
+app.post('/api/propiedades/publicar', async (req, res) => {
+    try {
+        console.log("Reenviando datos de publicación a Alaluf (save_ep.php):", JSON.stringify(req.body, null, 2));
+
+        // Petición HTTPS obligatoria al endpoint externo de publicación de Alaluf
+        const response = await axios.post('https://alaluf.cl/api/save_ep.php', req.body, {
+            headers: {
+                'X-API-KEY': process.env.ALALUF_API_KEY,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            }
+        });
+
+        // Retornamos la respuesta del servidor de Alaluf directamente hacia React
+        res.status(response.status || 200).json(response.data);
+
+    } catch (error) {
+        console.error("Error en el puente de publicación de propiedad:", error.message);
+        
+        if (error.response) {
+            console.error("Detalles del rechazo de Alaluf (save_ep.php):", error.response.data);
+            res.status(500).json({
+                error: "El servidor externo (Alaluf) rechazó la publicación",
+                alaluf_status: error.response.status,
+                alaluf_detalles: error.response.data
+            });
+        } else {
+            res.status(500).json({ 
+                error: "Error de infraestructura procesando la petición de publicación", 
+                detalles: error.message 
+            });
+        }
+    }
+});
+
+app.get('/api/test-publicacion-real', async (req, res) => {
+  try {
+
+    const payload = {
+      prop: "Av. Apoquindo 3000",
+      comuna: 13114,
+      tipoProp: 1,
+      sup: 100,
+      rz: "Juan Test",
+      rut: "18083379-K",
+      tel: "995318205",
+      email: "correo@gmail.com",
+      valor: 100000000,
+      rec: "Prueba API"
+    };
+
+    console.log("PAYLOAD:");
+    console.log(JSON.stringify(payload, null, 2));
+
+    const response = await axios.post(
+      'https://alaluf.cl/api/save_ep.php',
+      payload,
+      {
+        headers: {
+          'X-API-KEY': process.env.ALALUF_API_KEY,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+
+    console.log("RESPONSE:");
+    console.log(JSON.stringify(response.data, null, 2));
+
+    res.json(response.data);
+
+  } catch (error) {
+
+    console.error("================================");
+    console.error("STATUS:", error.response?.status);
+    console.error("HEADERS:", error.response?.headers);
+    console.error("DATA:", JSON.stringify(error.response?.data, null, 2));
+    console.error("================================");
+    
+    res.status(500).json({
+      status: error.response?.status,
+      data: error.response?.data
+    });
+  }
+});
+
+// Montaje de Rutas
+// ⚠️ Estos van DESPUÉS de las rutas inline específicas de /api/propiedades/publicar
+app.use('/api/propiedades', propiedadesRoutes);
+app.use('/api/indicadores', indicadoresRoutes); 
+app.use('/api', crmRoutes);
 
 // Ruta raíz de comprobación
 app.get('/', (req, res) => {
