@@ -61,6 +61,45 @@ app.get('/api/conteo-tipos', async (req, res) => {
     }
 });
 
+// 🌟 PUENTE / PROXY PARA GUARDAR LEADS / VISITAS HACIA ALALUF (MEJORADO)
+app.post('/api/save_lead', async (req, res) => {
+    try {
+        console.log("Enviando payload a Alaluf:", JSON.stringify(req.body, null, 2));
+
+        // Reenvía los datos recibidos desde React hacia la API de Alaluf
+        const response = await axios.post('https://alaluf.cl/api/save_lead.php', req.body, {
+            headers: {
+                'X-API-KEY': process.env.ALALUF_API_KEY,
+                'Content-Type': 'application/json',
+                'Accept': 'application/json'
+            }
+        });
+
+        // Retorna la respuesta de Alaluf hacia tu frontend
+        res.status(response.status || 200).json(response.data);
+
+    } catch (error) {
+        console.error("Error en el puente de guardado de lead:", error.message);
+        
+        // 🌟 Inspeccionamos si el error proviene directamente de la API de Alaluf
+        if (error.response) {
+            // Alaluf respondió con un código de estado de error (ej: 400, 401, etc.)
+            console.error("Detalles del error devuelto por Alaluf:", error.response.data);
+            res.status(500).json({
+                error: "El servidor externo (Alaluf) rechazó la petición de guardado",
+                alaluf_status: error.response.status,
+                alaluf_detalles: error.response.data
+            });
+        } else {
+            // Problema interno de red, timeout o configuración de Axios
+            res.status(500).json({ 
+                error: "No se pudo procesar la solicitud hacia el servidor externo", 
+                detalles: error.message 
+            });
+        }
+    }
+});
+
 // Ruta raíz de comprobación
 app.get('/', (req, res) => {
     res.send('Servidor Alaluf Bridge operativo 🚀');
