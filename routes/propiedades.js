@@ -55,6 +55,8 @@ const mapearPropiedad = (prop) => {
         codigo: prop.codigo_propiedad || prop.codigo_interno || prop.id_propiedad,    
         titulo: prop.desc_tipo_prop || prop.desc_tipo || "Propiedad",
         operacion: prop.desc_obj || "Venta / Arriendo",
+        // Extraemos la fecha para el nuevo ordenamiento (soporta varios formatos comunes)
+        fecha: prop.fecha_publicacion || prop.fecha || prop.created_at || prop.fecha_ingreso || null,
         ubicacion: {
             comuna: prop.com_nombre || prop.comuna || "Sin Comuna",
             sector: prop.sector_cercano || "Sin Sector",
@@ -171,23 +173,32 @@ router.get('/buscar', async (req, res) => {
         // 2. MAPEO
         let mappedItems = rawDataArray.map(prop => mapearPropiedad(prop));
 
-        // 3. FILTROS AVANZADOS HORIZONTALES
+        // 3. FILTROS AVANZADOS HORIZONTALES Y LÓGICA VENTA/ARRIENDO
         const fComuna = req.query.comuna;
         const fSupDesde = parseFloat(req.query.sup_desde);
         const fSupHasta = parseFloat(req.query.sup_hasta);
         const fPrecioDesde = parseFloat(req.query.precio_desde);
         const fPrecioHasta = parseFloat(req.query.precio_hasta);
         const fOrden = req.query.orden || 'desc'; 
+        const fObj = req.query.obj || "1"; // "1" = Comprar, "2" = Arrendar
 
         mappedItems = mappedItems.filter(item => {
             let match = true;
+
+            // 🔥 REPLICA LA LÓGICA DEL FRONTEND PARA VENTA/ARRIENDO
+            const valVenta = parseFloat(item.precios.venta.valor || 0);
+            const valArriendo = parseFloat(item.precios.arriendo.valor || 0);
+            const tieneVenta = valVenta > 0;
+            const tieneArriendo = valArriendo > 0;
+
+            if (fObj === "1" && !tieneVenta) match = false;
+            if (fObj === "2" && !tieneArriendo) match = false;
+
             if (fComuna) match = match && item.ubicacion.comuna.toLowerCase().includes(fComuna.toLowerCase());
             if (!isNaN(fSupDesde)) match = match && item.detalles.superficie >= fSupDesde;
             if (!isNaN(fSupHasta)) match = match && item.detalles.superficie <= fSupHasta;
             
             if (!isNaN(fPrecioDesde) || !isNaN(fPrecioHasta)) {
-                const valVenta = parseFloat(item.precios.venta.valor || 0);
-                const valArriendo = parseFloat(item.precios.arriendo.valor || 0);
                 const valorMax = Math.max(valVenta, valArriendo);
                 
                 if (!isNaN(fPrecioDesde)) match = match && valorMax >= fPrecioDesde;
@@ -196,10 +207,20 @@ router.get('/buscar', async (req, res) => {
             return match;
         });
 
-        // 4. ORDENAMIENTO
+        // 4. ORDENAMIENTO (🔥 MÁS RECIENTES PRIMERO)
         mappedItems.sort((a, b) => {
+            const fechaA = new Date(a.fecha || 0).getTime();
+            const fechaB = new Date(b.fecha || 0).getTime();
+            
+            // Prioridad 1: Ordenar por fecha descendente (más nuevos primero)
+            if (fechaB !== fechaA) {
+                return fechaB - fechaA; 
+            }
+            
+            // Prioridad 2: Fallback por precio u ID si la fecha es igual o no existe
             const getPrice = (item) => Math.max(parseFloat(item.precios.venta.valor || 0), parseFloat(item.precios.arriendo.valor || 0));
             const priceDiff = fOrden === 'asc' ? getPrice(a) - getPrice(b) : getPrice(b) - getPrice(a);
+            
             return priceDiff !== 0 ? priceDiff : b.id - a.id; 
         });
 
@@ -209,7 +230,7 @@ router.get('/buscar', async (req, res) => {
         const startIndex = (page - 1) * limit;
         const propiedadesDeEstaPagina = mappedItems.slice(startIndex, startIndex + limit);
 
-        // 6. ENRIQUECER FICHAS (Solo a las 10 visibles, con timeout agresivo)
+        // 6. ENRIQUECER FICHAS (Solo a las que se van a renderizar)
         const promesas = propiedadesDeEstaPagina.map(async (mapeada) => {
             if (mapeada.imagenes.length === 0 || !mapeada.coords.lat) {
                 const fichaCacheKey = `ficha_${mapeada.codigo}`;
@@ -219,14 +240,14 @@ router.get('/buscar', async (req, res) => {
                     try {
                         const fichaResp = await alalufAxios.get(`${BASE_URL_ALALUF}/api/propiedad.php`, {
                             params: { id_propiedad: mapeada.codigo },
-                            timeout: 800 // 🔥 MEGA REDUCIDO. Si Alaluf no responde en 800ms, abortamos para no hacer esperar a tu usuario.
+                            timeout: 800 // Timeout agresivo mantenido
                         });
                         if (fichaResp.data?.data) {
                             fichaCompleta = mapearPropiedad(fichaResp.data.data);
                             detailCache.set(fichaCacheKey, fichaCompleta); 
                         }
                     } catch (e) {
-                        // Silenciado intencionalmente. 
+                        // Silenciado intencionalmente
                     }
                 }
 
