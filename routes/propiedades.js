@@ -3,18 +3,16 @@ const router = express.Router();
 const axios = require('axios');
 const NodeCache = require('node-cache');
 
-// 🚀 Caché en memoria: guarda búsquedas por 10 minutos (600 segundos)
-// y los detalles individuales por 30 minutos (1800 segundos)
-const searchCache = new NodeCache({ stdTTL: 600 });
-const detailCache = new NodeCache({ stdTTL: 1800 });
+// Caché para detalles individuales (1 hora)
+const detailCache = new NodeCache({ stdTTL: 3600 });
 
 const alalufAxios = axios.create({
     headers: {
         'X-API-KEY': process.env.ALALUF_API_KEY,
-        'User-Agent': 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (X11; Ubuntu; Linux x86_64)',
         'Accept': 'application/json'
     },
-    timeout: 15000,
+    timeout: 10000, 
     validateStatus: (status) => status < 500 
 });
 
@@ -85,100 +83,102 @@ const mapearPropiedad = (prop) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-// RUTA BUSCAR OPTIMIZADA CON FILTROS HORIZONTALES
+// BASE DE DATOS EN MEMORIA (SYNC NO BLOQUEANTE)
+// ─────────────────────────────────────────────────────────────
+let MEMORY_DB = [];
+let isSyncing = false;
+
+const syncDatabase = async () => {
+    if (isSyncing) return;
+    isSyncing = true;
+    console.log("🔄 [CRON] Iniciando sincronización de propiedades...");
+    
+    try {
+        let offset = 0;
+        let tempArray = []; 
+        let idsVistos = new Set();
+        let keepFetching = true;
+
+        while (keepFetching && offset <= 6000) {
+            const resp = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, {
+                params: { limit: 50, offset }
+            }).catch(() => null);
+
+            const data = resp?.data?.data || [];
+            if (data.length === 0) break;
+
+            data.forEach(p => {
+                const id = p.id_propiedad || p.codigo_interno;
+                if (!idsVistos.has(id)) {
+                    idsVistos.add(id);
+                    tempArray.push(p); 
+                }
+            });
+
+            if (data.length < 50) keepFetching = false;
+            offset += 50;
+            
+            await new Promise(resolve => setTimeout(resolve, 100)); 
+        }
+
+        if (tempArray.length > 500) {
+            MEMORY_DB = tempArray;
+            console.log(`✅ [CRON] Sincronización exitosa. ${MEMORY_DB.length} propiedades listas.`);
+        }
+    } catch (error) {
+        console.error("❌ [CRON] Error no bloqueante:", error.message);
+    } finally {
+        isSyncing = false;
+    }
+};
+
+// Ejecutar al iniciar y cada 1 hora
+syncDatabase();
+setInterval(syncDatabase, 60 * 60 * 1000);
+
+// ─────────────────────────────────────────────────────────────
+// RUTA BUSCAR ULTRARRÁPIDA (Filtra en RAM)
 // ─────────────────────────────────────────────────────────────
 router.get('/buscar', async (req, res) => {
     try {
         const page  = parseInt(req.query.page)  || 1;
         const limit = parseInt(req.query.limit) || 10;
+        
+        let rawDataArray = MEMORY_DB;
 
-        const alalufQuery = { ...req.query };
-        delete alalufQuery.page;
-        delete alalufQuery.limit;
-
-        // Limpiamos los parámetros de filtros horizontales para realizar una petición base al origen
-        const apiQuery = { ...alalufQuery };
-        delete apiQuery.comuna;
-        delete apiQuery.sup_desde;
-        delete apiQuery.sup_hasta;
-        delete apiQuery.precio_desde;
-        delete apiQuery.precio_hasta;
-        delete apiQuery.moneda;
-        delete apiQuery.orden;
-
-        // 🚀 Generamos un identificador único para los parámetros de búsqueda base exactos
-        const cacheKey = JSON.stringify(apiQuery);
-        let rawDataArray = searchCache.get(cacheKey);
-
-        // Solo vamos a la API externa si la búsqueda no está en caché
-        if (!rawDataArray) {
-            console.log("── NO EN CACHÉ. DESCARGANDO DESDE ALALUF:", apiQuery);
-            
-            const firstResponse = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, {
-                params: { ...apiQuery, limit: 50, offset: 0 }
-            });
-
-            const firstData = firstResponse.data?.data || [];
-            rawDataArray = [...firstData];
-
-            if (firstData.length === 50) {
-                let offset = 50;
-                let hayMas = true;
-                const idsVistos = new Set(firstData.map(p => p.id_propiedad || p.codigo_interno));
-
-                while (hayMas && offset <= 5000) {
-                    const resp = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, {
-                        params: { ...apiQuery, limit: 50, offset }
-                    }).catch(() => null);
-
-                    const data = resp?.data?.data || [];
-                    
-                    if (data.length === 0) break;
-
-                    const nuevos = data.filter(p => !idsVistos.has(p.id_propiedad || p.codigo_interno));
-                    if (nuevos.length === 0) break;
-
-                    nuevos.forEach(p => {
-                        idsVistos.add(p.id_propiedad || p.codigo_interno);
-                        rawDataArray.push(p);
-                    });
-
-                    if (data.length < 50) hayMas = false;
-                    offset += 50;
-                }
-            }
-            
-            // 🚀 Guardamos el arreglo masivo en memoria para las próximas peticiones
-            searchCache.set(cacheKey, rawDataArray);
-            console.log(`TOTAL DESCARGADO Y GUARDADO EN CACHÉ: ${rawDataArray.length}`);
-        } else {
-            console.log(`── SIRVIENDO DESDE CACHÉ: ${rawDataArray.length} propiedades encontradas`);
+        // Fallback de emergencia
+        if (rawDataArray.length === 0) {
+            const fallbackResp = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, { 
+                params: { limit: 100 } 
+            }).catch(() => null);
+            rawDataArray = fallbackResp?.data?.data || [];
         }
 
-        // 🌟 MAPEO E INTEGRACIÓN DE FILTROS HORIZONTALES AVANZADOS 🌟
+        // Filtros básicos
+        if (req.query.tipo_prop) {
+            rawDataArray = rawDataArray.filter(p => p.tipo_prop == req.query.tipo_prop || p.id_tipo_prop == req.query.tipo_prop);
+        }
+        if (req.query.obj) {
+            rawDataArray = rawDataArray.filter(p => p.obj == req.query.obj);
+        }
+
         let mappedItems = rawDataArray.map(prop => mapearPropiedad(prop));
 
-        // Aplicar filtros en memoria
+        // Filtros avanzados
         const fComuna = req.query.comuna;
         const fSupDesde = parseFloat(req.query.sup_desde);
         const fSupHasta = parseFloat(req.query.sup_hasta);
         const fPrecioDesde = parseFloat(req.query.precio_desde);
         const fPrecioHasta = parseFloat(req.query.precio_hasta);
-        const fOrden = req.query.orden || 'desc'; // 'desc' mayor a menor, 'asc' menor a mayor
+        const fOrden = req.query.orden || 'desc'; 
 
         mappedItems = mappedItems.filter(item => {
             let match = true;
-            if (fComuna) {
-                match = match && item.ubicacion.comuna.toLowerCase().includes(fComuna.toLowerCase());
-            }
-            if (!isNaN(fSupDesde)) {
-                match = match && item.detalles.superficie >= fSupDesde;
-            }
-            if (!isNaN(fSupHasta)) {
-                match = match && item.detalles.superficie <= fSupHasta;
-            }
+            if (fComuna) match = match && item.ubicacion.comuna.toLowerCase().includes(fComuna.toLowerCase());
+            if (!isNaN(fSupDesde)) match = match && item.detalles.superficie >= fSupDesde;
+            if (!isNaN(fSupHasta)) match = match && item.detalles.superficie <= fSupHasta;
+            
             if (!isNaN(fPrecioDesde) || !isNaN(fPrecioHasta)) {
-                // Comprobamos el precio en venta o arriendo indistintamente
                 const valVenta = parseFloat(item.precios.venta.valor || 0);
                 const valArriendo = parseFloat(item.precios.arriendo.valor || 0);
                 const valorMax = Math.max(valVenta, valArriendo);
@@ -189,26 +189,19 @@ router.get('/buscar', async (req, res) => {
             return match;
         });
 
-        // Ordenamiento dinámico
         mappedItems.sort((a, b) => {
-            const getPrice = (item) => {
-                const valVenta = parseFloat(item.precios.venta.valor || 0);
-                const valArriendo = parseFloat(item.precios.arriendo.valor || 0);
-                return Math.max(valVenta, valArriendo);
-            };
-            return fOrden === 'asc' ? getPrice(a) - getPrice(b) : getPrice(b) - getPrice(a);
+            const getPrice = (item) => Math.max(parseFloat(item.precios.venta.valor || 0), parseFloat(item.precios.arriendo.valor || 0));
+            const priceDiff = fOrden === 'asc' ? getPrice(a) - getPrice(b) : getPrice(b) - getPrice(a);
+            return priceDiff !== 0 ? priceDiff : b.id - a.id; 
         });
 
-        // Paginación final
         const totalItems = mappedItems.length;
         const totalPages = Math.ceil(totalItems / limit);
         const startIndex = (page - 1) * limit;
         const propiedadesDeEstaPagina = mappedItems.slice(startIndex, startIndex + limit);
 
-        // Enriquecer con fotos / coords optimizado con caché individual
         const promesas = propiedadesDeEstaPagina.map(async (mapeada) => {
             if (mapeada.imagenes.length === 0 || !mapeada.coords.lat) {
-                // 🚀 Revisar si ya tenemos la ficha guardada
                 const fichaCacheKey = `ficha_${mapeada.codigo}`;
                 let fichaCompleta = detailCache.get(fichaCacheKey);
 
@@ -216,15 +209,13 @@ router.get('/buscar', async (req, res) => {
                     try {
                         const fichaResp = await alalufAxios.get(`${BASE_URL_ALALUF}/api/propiedad.php`, {
                             params: { id_propiedad: mapeada.codigo },
-                            timeout: 4000
+                            timeout: 800 
                         });
                         if (fichaResp.data?.data) {
                             fichaCompleta = mapearPropiedad(fichaResp.data.data);
-                            detailCache.set(fichaCacheKey, fichaCompleta); // Guardar en caché
+                            detailCache.set(fichaCacheKey, fichaCompleta); 
                         }
-                    } catch (e) {
-                        console.error(`Error obteniendo ID ${mapeada.codigo}`);
-                    }
+                    } catch (e) {}
                 }
 
                 if (fichaCompleta) {
@@ -249,19 +240,15 @@ router.get('/buscar', async (req, res) => {
         });
 
     } catch (error) {
-        console.error("Error en /buscar:", error);
+        console.error("Error en /buscar:", error.message);
         res.status(500).json({ error: "Error interno del servidor" });
     }
 });
 
-// ─────────────────────────────────────────────────────────────
-// RUTA INDIVIDUAL (También cacheada)
-// ─────────────────────────────────────────────────────────────
 router.get('/:id', async (req, res) => {
     const term = req.params.id;
     const cacheKey = `ficha_endpoint_${term}`;
     
-    // 🚀 Intentar recuperar de caché
     const cachedResponse = detailCache.get(cacheKey);
     if (cachedResponse) return res.json(cachedResponse);
 
