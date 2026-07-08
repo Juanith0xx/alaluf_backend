@@ -83,7 +83,7 @@ const mapearPropiedad = (prop) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-// BASE DE DATOS EN MEMORIA (SYNC NO BLOQUEANTE)
+// 🔥 LA SOLUCIÓN: BASE DE DATOS EN MEMORIA (CRON JOB)
 // ─────────────────────────────────────────────────────────────
 let MEMORY_DB = [];
 let isSyncing = false;
@@ -91,13 +91,13 @@ let isSyncing = false;
 const syncDatabase = async () => {
     if (isSyncing) return;
     isSyncing = true;
-    console.log("🔄 [CRON] Iniciando sincronización de propiedades...");
+    console.log("🔄 [CRON] Iniciando sincronización de propiedades desde Alaluf...");
     
     try {
         let offset = 0;
-        let tempArray = []; 
-        let idsVistos = new Set();
         let keepFetching = true;
+        let tempArray = [];
+        let idsVistos = new Set();
 
         while (keepFetching && offset <= 6000) {
             const resp = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, {
@@ -111,30 +111,31 @@ const syncDatabase = async () => {
                 const id = p.id_propiedad || p.codigo_interno;
                 if (!idsVistos.has(id)) {
                     idsVistos.add(id);
-                    tempArray.push(p); 
+                    tempArray.push(p); // Guardamos la data cruda original
                 }
             });
 
             if (data.length < 50) keepFetching = false;
             offset += 50;
-            
-            await new Promise(resolve => setTimeout(resolve, 100)); 
+
+            // ⏱️ VITAL: Esperamos 300ms entre peticiones para no colapsar a Alaluf
+            await new Promise(resolve => setTimeout(resolve, 300));
         }
 
-        if (tempArray.length > 500) {
+        if (tempArray.length > 0) {
             MEMORY_DB = tempArray;
-            console.log(`✅ [CRON] Sincronización exitosa. ${MEMORY_DB.length} propiedades listas.`);
+            console.log(`✅ [CRON] Sincronización exitosa. ${MEMORY_DB.length} propiedades en caché RAM.`);
         }
     } catch (error) {
-        console.error("❌ [CRON] Error no bloqueante:", error.message);
+        console.error("❌ [CRON] Error en sincronización:", error.message);
     } finally {
         isSyncing = false;
     }
 };
 
-// Ejecutar al iniciar y cada 1 hora
+// Ejecutar al iniciar el servidor y luego cada 30 minutos
 syncDatabase();
-setInterval(syncDatabase, 60 * 60 * 1000);
+setInterval(syncDatabase, 30 * 60 * 1000);
 
 // ─────────────────────────────────────────────────────────────
 // RUTA BUSCAR ULTRARRÁPIDA (Filtra en RAM)
@@ -146,15 +147,20 @@ router.get('/buscar', async (req, res) => {
         
         let rawDataArray = MEMORY_DB;
 
-        // Fallback de emergencia
+        // Fallback de emergencia si la memoria está vacía (ej: servidor recién reiniciado)
         if (rawDataArray.length === 0) {
+            console.log("⚠️ Memoria vacía, haciendo fallback directo a Alaluf...");
+            const apiQuery = { ...req.query };
+            delete apiQuery.page; delete apiQuery.limit; delete apiQuery.comuna; delete apiQuery.sup_desde; delete apiQuery.sup_hasta; delete apiQuery.precio_desde; delete apiQuery.precio_hasta; delete apiQuery.moneda; delete apiQuery.orden;
+            
             const fallbackResp = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, { 
-                params: { limit: 100 } 
+                params: { ...apiQuery, limit: 100 } 
             }).catch(() => null);
+            
             rawDataArray = fallbackResp?.data?.data || [];
         }
 
-        // Filtros básicos
+        // 1. FILTRADO ESTRUCTURAL (Simulando lo que hacía la API externa)
         if (req.query.tipo_prop) {
             rawDataArray = rawDataArray.filter(p => p.tipo_prop == req.query.tipo_prop || p.id_tipo_prop == req.query.tipo_prop);
         }
@@ -162,9 +168,10 @@ router.get('/buscar', async (req, res) => {
             rawDataArray = rawDataArray.filter(p => p.obj == req.query.obj);
         }
 
+        // 2. MAPEO
         let mappedItems = rawDataArray.map(prop => mapearPropiedad(prop));
 
-        // Filtros avanzados
+        // 3. FILTROS AVANZADOS HORIZONTALES
         const fComuna = req.query.comuna;
         const fSupDesde = parseFloat(req.query.sup_desde);
         const fSupHasta = parseFloat(req.query.sup_hasta);
@@ -189,17 +196,20 @@ router.get('/buscar', async (req, res) => {
             return match;
         });
 
+        // 4. ORDENAMIENTO
         mappedItems.sort((a, b) => {
             const getPrice = (item) => Math.max(parseFloat(item.precios.venta.valor || 0), parseFloat(item.precios.arriendo.valor || 0));
             const priceDiff = fOrden === 'asc' ? getPrice(a) - getPrice(b) : getPrice(b) - getPrice(a);
             return priceDiff !== 0 ? priceDiff : b.id - a.id; 
         });
 
+        // 5. PAGINACIÓN
         const totalItems = mappedItems.length;
         const totalPages = Math.ceil(totalItems / limit);
         const startIndex = (page - 1) * limit;
         const propiedadesDeEstaPagina = mappedItems.slice(startIndex, startIndex + limit);
 
+        // 6. ENRIQUECER FICHAS (Solo a las 10 visibles, con timeout agresivo)
         const promesas = propiedadesDeEstaPagina.map(async (mapeada) => {
             if (mapeada.imagenes.length === 0 || !mapeada.coords.lat) {
                 const fichaCacheKey = `ficha_${mapeada.codigo}`;
@@ -209,13 +219,15 @@ router.get('/buscar', async (req, res) => {
                     try {
                         const fichaResp = await alalufAxios.get(`${BASE_URL_ALALUF}/api/propiedad.php`, {
                             params: { id_propiedad: mapeada.codigo },
-                            timeout: 800 
+                            timeout: 800 // 🔥 MEGA REDUCIDO. Si Alaluf no responde en 800ms, abortamos para no hacer esperar a tu usuario.
                         });
                         if (fichaResp.data?.data) {
                             fichaCompleta = mapearPropiedad(fichaResp.data.data);
                             detailCache.set(fichaCacheKey, fichaCompleta); 
                         }
-                    } catch (e) {}
+                    } catch (e) {
+                        // Silenciado intencionalmente. 
+                    }
                 }
 
                 if (fichaCompleta) {
@@ -245,6 +257,9 @@ router.get('/buscar', async (req, res) => {
     }
 });
 
+// ─────────────────────────────────────────────────────────────
+// RUTA INDIVIDUAL (También cacheada)
+// ─────────────────────────────────────────────────────────────
 router.get('/:id', async (req, res) => {
     const term = req.params.id;
     const cacheKey = `ficha_endpoint_${term}`;
