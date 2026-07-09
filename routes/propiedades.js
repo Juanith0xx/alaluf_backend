@@ -85,9 +85,13 @@ const mapearPropiedad = (prop) => {
 };
 
 // ─────────────────────────────────────────────────────────────
-// RUTA BUSCAR OPTIMIZADA CON FILTROS HORIZONTALES
+// RUTA BUSCAR OPTIMIZADA (Lotes Concurrentes)
 // ─────────────────────────────────────────────────────────────
 router.get('/buscar', async (req, res) => {
+
+    const startTime = Date.now();
+
+    
     try {
         const page  = parseInt(req.query.page)  || 1;
         const limit = parseInt(req.query.limit) || 10;
@@ -96,7 +100,6 @@ router.get('/buscar', async (req, res) => {
         delete alalufQuery.page;
         delete alalufQuery.limit;
 
-        // Limpiamos los parámetros de filtros horizontales para realizar una petición base al origen
         const apiQuery = { ...alalufQuery };
         delete apiQuery.comuna;
         delete apiQuery.sup_desde;
@@ -106,11 +109,9 @@ router.get('/buscar', async (req, res) => {
         delete apiQuery.moneda;
         delete apiQuery.orden;
 
-        // 🚀 Generamos un identificador único para los parámetros de búsqueda base exactos
         const cacheKey = JSON.stringify(apiQuery);
         let rawDataArray = searchCache.get(cacheKey);
 
-        // Solo vamos a la API externa si la búsqueda no está en caché
         if (!rawDataArray) {
             console.log("── NO EN CACHÉ. DESCARGANDO DESDE ALALUF:", apiQuery);
             
@@ -119,96 +120,127 @@ router.get('/buscar', async (req, res) => {
             });
 
             const firstData = firstResponse.data?.data || [];
-            rawDataArray = [...firstData];
+            rawDataArray = Array.isArray(firstData) ? [...firstData] : [];
 
-            if (firstData.length === 50) {
-                let offset = 50;
+           if (rawDataArray.length === 50)  {
+                let currentOffset = 50;
                 let hayMas = true;
-                const idsVistos = new Set(firstData.map(p => p.id_propiedad || p.codigo_interno));
+                const idsVistos = new Set(rawDataArray.map(p => p.id_propiedad || p.codigo_interno));
+                
+                // 🚀 Reducimos a 2 peticiones simultáneas para evitar que Alaluf nos bloquee la IP
+                const BATCH_SIZE = 2; 
 
-                while (hayMas && offset <= 5000) {
-                    const resp = await alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, {
-                        params: { ...apiQuery, limit: 50, offset }
-                    }).catch(() => null);
+                while (hayMas && currentOffset <= 5000) {
+                    const promesasBatch = [];
+                    for (let i = 0; i < BATCH_SIZE; i++) {
+                        promesasBatch.push(
+                            alalufAxios.get(`${BASE_URL_ALALUF}/api/res.php`, {
+                                params: { ...apiQuery, limit: 50, offset: currentOffset + (i * 50) }
+                            }).catch(() => null) 
+                        );
+                    }
 
-                    const data = resp?.data?.data || [];
-                    
-                    if (data.length === 0) break;
+                    const respuestas = await Promise.all(promesasBatch);
+                    let batchTuvoResultadosVacios = false;
 
-                    const nuevos = data.filter(p => !idsVistos.has(p.id_propiedad || p.codigo_interno));
-                    if (nuevos.length === 0) break;
+                    for (const resp of respuestas) {
+                        const data = resp?.data?.data;
+                        if (!data || !Array.isArray(data) || data.length === 0) {
+                            batchTuvoResultadosVacios = true;
+                            continue;
+                        }
+                        
+                        data.forEach(p => {
+                            const id = p.id_propiedad || p.codigo_interno;
+                            if (!idsVistos.has(id)) {
+                                idsVistos.add(id);
+                                rawDataArray.push(p);
+                            }
+                        });
 
-                    nuevos.forEach(p => {
-                        idsVistos.add(p.id_propiedad || p.codigo_interno);
-                        rawDataArray.push(p);
-                    });
+                        if (data.length < 50) {
+                            batchTuvoResultadosVacios = true;
+                        }
+                    }
 
-                    if (data.length < 50) hayMas = false;
-                    offset += 50;
+                    if (batchTuvoResultadosVacios) hayMas = false;
+                    currentOffset += (50 * BATCH_SIZE);
                 }
             }
             
-            // 🚀 Guardamos el arreglo masivo en memoria para las próximas peticiones
             searchCache.set(cacheKey, rawDataArray);
             console.log(`TOTAL DESCARGADO Y GUARDADO EN CACHÉ: ${rawDataArray.length}`);
+            console.log(`DEBUG [1 - Descarga]: ${Date.now() - startTime}ms`);
         } else {
             console.log(`── SIRVIENDO DESDE CACHÉ: ${rawDataArray.length} propiedades encontradas`);
         }
 
-        // 🌟 MAPEO E INTEGRACIÓN DE FILTROS HORIZONTALES AVANZADOS 🌟
         let mappedItems = rawDataArray.map(prop => mapearPropiedad(prop));
 
-        // Aplicar filtros en memoria
-        const fComuna = req.query.comuna;
+        // 🌟 FILTROS ESTRICTOS (Migrados tal cual los tenías en tu Frontend)
+        const fComuna = req.query.comuna && req.query.comuna !== "undefined" ? req.query.comuna : "";
         const fSupDesde = parseFloat(req.query.sup_desde);
         const fSupHasta = parseFloat(req.query.sup_hasta);
         const fPrecioDesde = parseFloat(req.query.precio_desde);
         const fPrecioHasta = parseFloat(req.query.precio_hasta);
-        const fOrden = req.query.orden || 'desc'; // 'desc' mayor a menor, 'asc' menor a mayor
+        const fOrden = req.query.orden || 'desc'; 
+        const fObj = req.query.obj || "1";
 
         mappedItems = mappedItems.filter(item => {
             let match = true;
+
+            // 1. Filtro estricto de Operación (Comprar = 1, Arrendar = 2)
+            const valVenta = parseFloat(item.precios?.venta?.valor || 0);
+            const valArriendo = parseFloat(item.precios?.arriendo?.valor || 0);
+            const tieneVenta = valVenta > 0;
+            const tieneArriendo = valArriendo > 0;
+
+            if (fObj === "1") match = match && tieneVenta;
+            if (fObj === "2") match = match && tieneArriendo;
+
+            // 2. Comuna
             if (fComuna) {
                 match = match && item.ubicacion.comuna.toLowerCase().includes(fComuna.toLowerCase());
             }
-            if (!isNaN(fSupDesde)) {
-                match = match && item.detalles.superficie >= fSupDesde;
-            }
-            if (!isNaN(fSupHasta)) {
-                match = match && item.detalles.superficie <= fSupHasta;
-            }
+
+            // 3. Superficie
+            if (!isNaN(fSupDesde)) match = match && item.detalles.superficie >= fSupDesde;
+            if (!isNaN(fSupHasta)) match = match && item.detalles.superficie <= fSupHasta;
+
+            // 4. Precios
             if (!isNaN(fPrecioDesde) || !isNaN(fPrecioHasta)) {
-                // Comprobamos el precio en venta o arriendo indistintamente
-                const valVenta = parseFloat(item.precios.venta.valor || 0);
-                const valArriendo = parseFloat(item.precios.arriendo.valor || 0);
                 const valorMax = Math.max(valVenta, valArriendo);
-                
                 if (!isNaN(fPrecioDesde)) match = match && valorMax >= fPrecioDesde;
                 if (!isNaN(fPrecioHasta)) match = match && valorMax <= fPrecioHasta;
             }
+
             return match;
         });
 
-        // Ordenamiento dinámico
+        // 🌟 ORDENAMIENTO SEGURO
         mappedItems.sort((a, b) => {
-            const getPrice = (item) => {
-                const valVenta = parseFloat(item.precios.venta.valor || 0);
-                const valArriendo = parseFloat(item.precios.arriendo.valor || 0);
-                return Math.max(valVenta, valArriendo);
-            };
-            return fOrden === 'asc' ? getPrice(a) - getPrice(b) : getPrice(b) - getPrice(a);
+            if (fOrden === 'asc' || fOrden === 'desc') {
+                const valA = Math.max(parseFloat(a.precios?.venta?.valor || 0), parseFloat(a.precios?.arriendo?.valor || 0));
+                const valB = Math.max(parseFloat(b.precios?.venta?.valor || 0), parseFloat(b.precios?.arriendo?.valor || 0));
+                return fOrden === 'asc' ? valA - valB : valB - valA;
+            }
+            // Por defecto: Más recientes primero usando IDs de forma segura
+            const idA = parseInt(a.id) || 0;
+            const idB = parseInt(b.id) || 0;
+            return idB - idA;
         });
 
-        // Paginación final
+        console.log(`DEBUG [2 - Filtros y Sort]: ${Date.now() - startTime}ms`);
+
+        // 🚀 Paginación
         const totalItems = mappedItems.length;
         const totalPages = Math.ceil(totalItems / limit);
         const startIndex = (page - 1) * limit;
         const propiedadesDeEstaPagina = mappedItems.slice(startIndex, startIndex + limit);
 
-        // Enriquecer con fotos / coords optimizado con caché individual
-        const promesas = propiedadesDeEstaPagina.map(async (mapeada) => {
+        // Enriquecer solo las propiedades de la página actual
+        const promesasDetalles = propiedadesDeEstaPagina.map(async (mapeada) => {
             if (mapeada.imagenes.length === 0 || !mapeada.coords.lat) {
-                // 🚀 Revisar si ya tenemos la ficha guardada
                 const fichaCacheKey = `ficha_${mapeada.codigo}`;
                 let fichaCompleta = detailCache.get(fichaCacheKey);
 
@@ -220,7 +252,7 @@ router.get('/buscar', async (req, res) => {
                         });
                         if (fichaResp.data?.data) {
                             fichaCompleta = mapearPropiedad(fichaResp.data.data);
-                            detailCache.set(fichaCacheKey, fichaCompleta); // Guardar en caché
+                            detailCache.set(fichaCacheKey, fichaCompleta); 
                         }
                     } catch (e) {
                         console.error(`Error obteniendo ID ${mapeada.codigo}`);
@@ -236,7 +268,9 @@ router.get('/buscar', async (req, res) => {
             return mapeada;
         });
 
-        const resultados = await Promise.all(promesas);
+        console.log(`DEBUG [3 - Enriquecimiento detalles]: ${Date.now() - startTime}ms`);
+
+        const resultados = await Promise.all(promesasDetalles);
 
         res.json({
             data: resultados,
@@ -255,13 +289,12 @@ router.get('/buscar', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// RUTA INDIVIDUAL (También cacheada)
+// RUTA INDIVIDUAL 
 // ─────────────────────────────────────────────────────────────
 router.get('/:id', async (req, res) => {
     const term = req.params.id;
     const cacheKey = `ficha_endpoint_${term}`;
     
-    // 🚀 Intentar recuperar de caché
     const cachedResponse = detailCache.get(cacheKey);
     if (cachedResponse) return res.json(cachedResponse);
 
